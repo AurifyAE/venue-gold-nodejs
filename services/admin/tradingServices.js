@@ -7,7 +7,7 @@ import mt5Service from "../../services/Trading/mt5Service.js";
 import LPProfit from "../../models/LPProfit.js";
 
 const TROY_OUNCE_GRAMS = 31.103;
-const TTB_FACTOR = 116.64;
+const TTB_FACTOR = 117;
 
 const GRAMS_PER_BAR = {
   TTBAR: 117,

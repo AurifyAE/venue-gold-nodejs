@@ -1,108 +1,174 @@
-import mt5MarketDataService from "../Trading/mt5MarketDataService.js";
-import mt5Service from "../Trading/mt5Service.js";
+import mt5MarketDataService from "../../services/Trading/mt5MarketDataService.js";
+import mt5Service from "../../services/Trading/mt5Service.js";
+import { getUserBalance } from "../../services/market/balanceService.js";
+import { updateUserSession } from "../../services/market/sessionService.js";
 import {
   handleMainMenuMT5,
   handleVolumeInputMT5,
   handleOrderConfirmationMT5,
   handlePositionSelectionMT5,
+  formatCurrency,
 } from "../../controllers/chat/whatsappController.js";
 
-export const getPriceMessageMT5 = async () => {
-  try {
-    const marketData = await mt5MarketDataService.getMarketData(
-      process.env.MT5_SYMBOL || "XAUUSD_TTBAR.Fix"
-    );
-    if (!marketData) return "⚠️ Unable to fetch gold prices. Please try again.";
+// Constants
+const SYMBOL_MAPPING = {
+  TTBAR: process.env.MT5_SYMBOL || "XAUUSD.gm",
+  KGBAR: process.env.MT5_SYMBOL || "XAUUSD.gm",
+};
 
-    const timestamp = new Date(marketData.timestamp).toLocaleString("en-US", {
+const CONVERSION_FACTORS = {
+  TTBAR: 13.7628,
+  KGBAR: 32.1507 * 3.674,
+};
+
+const GRAMS_PER_BAR = {
+  TTBAR: 117,
+  KGBAR: 1000,
+};
+
+// Get live price message
+export const getPriceMessageMT5 = async (symbol = "TTBAR", askSpread = 0, bidSpread = 0) => {
+  try {
+    const marketData = await mt5MarketDataService.getMarketData(SYMBOL_MAPPING[symbol]);
+    if (!marketData || !marketData.ask || !marketData.bid) {
+      return "⚠️ Prices unavailable. Type MENU.";
+    }
+
+    const factor = CONVERSION_FACTORS[symbol];
+    const unit = symbol === "KGBAR" ? "KG" : "GRAM";
+    const adjustedAsk = (marketData.ask * factor) + askSpread;
+    const adjustedBid = (marketData.bid * factor) - bidSpread;
+    const spread = (marketData.ask - marketData.bid) ;
+
+    const timestamp = new Date().toLocaleString("en-US", {
       timeZone: "Asia/Dubai",
       dateStyle: "short",
-      timeStyle: "medium",
+      timeStyle: "short",
     });
-    return `💰 Live Gold Prices (XAUUSD_TTBAR.Fix)\n📈 Ask: $${marketData.ask.toFixed(
-      2
-    )}\n📉 Bid: $${marketData.bid.toFixed(
-      2
-    )}\n📊 Spread: ${marketData.spread.toFixed(
-      2
-    )}\n🕐 Updated: ${timestamp}\n📡 Source: MT5\n\nType MENU to return.`;
+
+    return `📈 ${symbol} Prices 🚀\n🟢 Buy: AED ${adjustedAsk.toFixed(2)}/${unit}\n🔴 Sell: AED ${adjustedBid.toFixed(2)}/${unit}\n📊 Spread: ${spread.toFixed(1)} pips\n🕐 ${timestamp}\n\n💬 1=Buy, 2=Sell, MENU`;
   } catch (error) {
-    console.error("Error getting MT5 prices:", error.message);
-    return "❌ Error fetching prices. Try again or contact support.";
+    console.error(`Error getting ${symbol} prices: ${error.message}`);
+    return "❌ Prices error. Type MENU.";
   }
 };
 
+// Main menu message
+export const getMainMenuMT5 = async (marketData, symbol = "TTBAR", userName = "", askSpread = 0, bidSpread = 0) => {
+  if (!marketData || !marketData.ask || !marketData.bid) {
+    return `👋 ${userName || "Client"} 🌟\n\n🥇 ${symbol} Prices: Unavailable\n\n📋 Options:\n1 Buy\n2 Sell\n3 Balance\n4 Positions\n5 Prices\n\n💬 Type 1 or 'buy 1'`;
+  }
+
+  const factor = CONVERSION_FACTORS[symbol];
+  const unit = symbol === "KGBAR" ? "KG" : "GRAM";
+  const adjustedAsk = (marketData.ask * factor) + askSpread;
+  const adjustedBid = (marketData.bid * factor) - bidSpread;
+
+  return `👋 ${userName || "Client"} 🌟\n\n🥇 ${symbol} Prices:\n🟢 Buy: AED ${adjustedAsk.toFixed(2)}/${unit}\n🔴 Sell: AED ${adjustedBid.toFixed(2)}/${unit}\n\n📋 Options:\n1 Buy\n2 Sell\n3 Balance\n4 Positions\n5 Prices\n\n💬 Type 1 or 'buy 1'`;
+};
+
+// Positions message
+export const getPositionsMessageMT5 = async (session, phoneNumber, symbol = "TTBAR") => {
+  try {
+    let positions = [];
+    try {
+      positions = await mt5Service.getPositions();
+    } catch (mt5Error) {
+      console.error(`MT5 getPositions error: ${mt5Error.message}`);
+    }
+
+    session.openPositions = positions || [];
+    session.state = "VIEW_POSITIONS";
+    updateUserSession(phoneNumber, session);
+
+    if (!positions || !positions.length) {
+      return `📋 Positions\nNo open positions.\n\n💬 Type MENU`;
+    }
+
+    const factor = CONVERSION_FACTORS[symbol];
+    let totalPL = 0;
+    let message = `📋 Open Positions 🏦\n\n`;
+
+    positions.forEach((position, index) => {
+      const profit = position.profit || 0;
+      totalPL += profit;
+      const plColor = profit >= 0 ? "🟢" : "🔴";
+      const plSign = profit >= 0 ? "+" : "";
+      const unit = symbol === "KGBAR" ? "KG" : "GRAM";
+      const openPrice = (position.price_open * factor).toFixed(2);
+      const currentPrice = (position.price_current * factor).toFixed(2);
+
+      message += `${position.type === "BUY" ? "📈" : "📉"} ${index + 1}. ${symbol}\n🎫 #${position.ticket} | ${position.volume} ${unit}\n💵 Open: AED ${openPrice}\n📍 Current: AED ${currentPrice}\n${plColor} P&L: ${plSign}AED ${Math.abs(profit).toFixed(2)}\n\n`;
+    });
+
+    const totalColor = totalPL >= 0 ? "🟢" : "🔴";
+    const totalSign = totalPL >= 0 ? "+" : "";
+    message += `${totalColor} Total P&L: ${totalSign}AED ${Math.abs(totalPL).toFixed(2)}\n\n💬 Number to close or MENU`;
+
+    return message;
+  } catch (error) {
+    console.error(`Error fetching positions: ${error.message}`);
+    return `❌ Positions error. Type MENU.`;
+  }
+};
+
+// Process user input
 export const processUserInputMT5 = async (
   message,
   session,
   twilioClient,
   from,
   twilioNumber,
-  phoneNumber
+  phoneNumber,
+  account
 ) => {
   const input = message.trim().toLowerCase();
   console.log(
-    `processUserInputMT5 called with input: ${input}, state: ${session.state}, phoneNumber: ${phoneNumber}`
+    `processUserInputMT5: input=${input}, state=${session.state}, phone=${phoneNumber}`
   );
 
   try {
+    const symbol = session.symbol || "TTBAR";
+    const marketData = await mt5MarketDataService.getMarketData(SYMBOL_MAPPING[symbol]);
+
+    const specialCommands = {
+      menu: async () => {
+        session.state = "MAIN_MENU";
+        updateUserSession(phoneNumber, session);
+        return await getMainMenuMT5(marketData, symbol, session.userName, account.askSpread || 0, account.bidSpread || 0);
+      },
+      price: async () => await getPriceMessageMT5(symbol, account.askSpread || 0, account.bidSpread || 0),
+      prices: async () => await getPriceMessageMT5(symbol, account.askSpread || 0, account.bidSpread || 0),
+      positions: async () => await getPositionsMessageMT5(session, phoneNumber, symbol),
+      balance: async () => {
+        const balance = await getUserBalance(session.accountId, phoneNumber);
+        return `💰 Balance 💸\nEquity: AED ${formatCurrency(account?.AMOUNTFC || balance.cash)}\nAvailable: AED ${formatCurrency(account?.reservedAmount || balance.cash)}\n\n💬 MENU`;
+      },
+      help: async () => `📖 Help 🆘\nMENU: Menu\nPRICE: Prices\nBALANCE: Balance\nPOSITIONS: Trades\nbuy 1: Buy gold\nsell 1: Sell gold\n\n📞 Support: +971 58 502 3411\n💬 MENU`,
+    };
+
+    if (specialCommands[input]) {
+      return await specialCommands[input]();
+    }
+
     switch (session.state) {
       case "MAIN_MENU":
-        return await handleMainMenuMT5(input, session, phoneNumber);
+        return await handleMainMenuMT5(input, session, phoneNumber, account, marketData, symbol);
       case "AWAITING_VOLUME":
-        return await handleVolumeInputMT5(input, session, phoneNumber);
+        return await handleVolumeInputMT5(input, session, phoneNumber, account, marketData, symbol);
       case "CONFIRM_ORDER":
-        console.log(
-          `Routing to handleOrderConfirmationMT5 for input: ${input}`
-        );
-        return await handleOrderConfirmationMT5(input, session, phoneNumber);
+        return await handleOrderConfirmationMT5(input, session, phoneNumber, account);
       case "VIEW_POSITIONS":
-        console.log(
-          `Routing to handlePositionSelectionMT5 for input: ${input}`
-        );
         return await handlePositionSelectionMT5(input, session, phoneNumber);
       default:
-        console.error(`Unknown session state: ${session.state}`);
         session.state = "MAIN_MENU";
-        return await getMainMenuMT5();
+        updateUserSession(phoneNumber, session);
+        return await getMainMenuMT5(marketData, symbol, session.userName, account.askSpread || 0, account.bidSpread || 0);
     }
   } catch (error) {
-    console.error("Input processing error:", error.message);
+    console.error(`Input processing error: ${error.message}`);
     session.state = "MAIN_MENU";
-    return "❌ Error occurred. Try again.\n\n" + (await getMainMenuMT5());
-  }
-};
-
-export const getMainMenuMT5 = () => {
-  return `🏆 Gold Trading Bot - MT5\n📊 Main Menu:\n1️⃣ Buy Gold\n2️⃣ Sell Gold\n3️⃣ Live Prices\n4️⃣ View Positions\n5️⃣ Close Position\n\n💡 Commands: Type number or keyword (e.g., '1', 'buy')\n🔔 Trades at live market prices`;
-};
-
-export const getPositionsMessageMT5 = async (session, phoneNumber) => {
-  try {
-    const positions = await mt5Service.getPositions();
-    if (!positions.length)
-      return `📊 Open Positions\n📝 No open positions.\n\nType MENU to return.`;
-
-    session.openPositions = positions;
-    session.state = "VIEW_POSITIONS";
-
-    let message = `📊 Open Positions\n`;
-    positions.forEach((position, index) => {
-      const profit =
-        position.profit > 0
-          ? `+$${position.profit.toFixed(2)}`
-          : `$${position.profit.toFixed(2)}`;
-      message += `${index + 1}️⃣ Ticket ${position.ticket}\n   📊 ${
-        position.type
-      } ${position.volume} TTBAR\n   💰 Open: $${position.price_open.toFixed(
-        2
-      )}\n   📈 Current: $${position.price_current.toFixed(
-        2
-      )}\n   📊 P&L: ${profit}\n\n`;
-    });
-    return `${message}🔧 Select position number to close or type MENU.`;
-  } catch (error) {
-    console.error("Error fetching positions:", error.message);
-    return "❌ Error fetching positions. Try again.\n\nType MENU to return.";
+    updateUserSession(phoneNumber, session);
+    return `❌ Error: ${error.message}\nType MENU.`;
   }
 };
