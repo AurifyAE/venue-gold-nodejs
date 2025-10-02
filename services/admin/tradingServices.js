@@ -120,7 +120,7 @@ export const createTrade = async (
         : userAccount.bidSpread || 0;
     const gramValue =
       symbol === "TTBAR" ? CONVERSION_FACTORS.TTBAR : CONVERSION_FACTORS.KGBAR;
-    const lpProfitValue = (gramValue * grams * spread).toFixed(2);
+    const lpProfitValue = (gramValue * volume * spread).toFixed(2);
 
     // Create order
     const newOrder = new Order({
@@ -349,7 +349,7 @@ export const createTrade = async (
         : finalLPPrice * CONVERSION_FACTORS.KGBAR * grams;
     finalLPPrice = updatedLPGoldWeightValue;
 
-    const updatedLPProfitValue = (gramValue * grams * spread).toFixed(2);
+    const updatedLPProfitValue = (gramValue * volume * spread).toFixed(2);
     console.log("+++++++++++++++++++++++++");
     console.log(finalClientOpeningPrice);
     console.log(finalLPPrice);

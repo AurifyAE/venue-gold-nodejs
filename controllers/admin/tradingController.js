@@ -124,11 +124,11 @@ export const createTrade = async (req, res, next) => {
     // Send WhatsApp confirmation message
     const confirmationMessage = `✅ Order Placed!\n📋 Type: ${
       tradeResult.mt5Trade.type
-    }\n💰 Volume: ${tradeResult.mt5Trade.volume} TTBAR\n💵 Price: $${tradeResult.clientOrder.openingPrice}\n📊 Order ID: ${tradeResult.mt5Trade.ticket}\n📡 Symbol: ${
-      tradeResult.mt5Trade.symbol
+    }\n💰 Volume: ${tradeResult.mt5Trade.volume} TTBAR\n💵 Price: AED ${tradeResult.clientOrder.openingPrice}\n📊 Order ID: ${tradeResult.mt5Trade.ticket}\n📡 Symbol: ${
+      tradeResult.clientOrder.symbol
     }\n🕒 ${new Date().toLocaleString("en-US", {
       timeZone: "Asia/Dubai",
-    })}\n\n${await getMainMenuMT5()}`;
+    })}`;
 
     try {
       await client.messages.create({
@@ -267,9 +267,9 @@ export const updateTrade = async (req, res, next) => {
     
     const successMessage = `✅ Position Closed Successfully!\n📊 Ticket: ${
       order.ticket
-    }\n💰 Close Price: $${updatedTrade.order.closingPrice}\n📈 P&L: $ ${updatedTrade.order.profit}\n🔄 ${mt5StatusText}\n🕒 ${new Date().toLocaleString("en-US", {
+    }\n💰 Open Price: AED ${updatedTrade.order.openingPrice}\n💰 Close Price: AED ${updatedTrade.order.closingPrice}\n📈 P&L: AED ${updatedTrade.order.profit}\n🕒 ${new Date().toLocaleString("en-US", {
       timeZone: "Asia/Dubai",
-    })}\n\n${await getMainMenuMT5()}`;
+    })}`;
 
     try {
       await client.messages.create({
