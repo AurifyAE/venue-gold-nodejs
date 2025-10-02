@@ -407,454 +407,454 @@ export const createTrade = async (
   }
 };
 
-export const updateTradeStatus = async (
-  adminId,
-  orderId,
-  updateData,
-  session = null
-) => {
-  const mongoSession = session || (await mongoose.startSession());
-  let committed = false;
-  let sessionEnded = false;
+  export const updateTradeStatus = async (
+    adminId,
+    orderId,
+    updateData,
+    session = null
+  ) => {
+    const mongoSession = session || (await mongoose.startSession());
+    let committed = false;
+    let sessionEnded = false;
 
-  try {
-    if (!session) mongoSession.startTransaction();
+    try {
+      if (!session) mongoSession.startTransaction();
 
-    const allowedUpdates = [
-      "orderStatus",
-      "closingPrice",
-      "closingDate",
-      "profit",
-      "comment",
-      "price",
-      "ticket",
-      "volume",
-      "symbol",
-      "notificationError",
-      "AMOUNTFC",
-    ];
-    const sanitizedData = {};
-    Object.keys(updateData).forEach((key) => {
-      if (allowedUpdates.includes(key)) {
-        sanitizedData[key] = updateData[key];
+      const allowedUpdates = [
+        "orderStatus",
+        "closingPrice",
+        "closingDate",
+        "profit",
+        "comment",
+        "price",
+        "ticket",
+        "volume",
+        "symbol",
+        "notificationError",
+        "AMOUNTFC",
+      ];
+      const sanitizedData = {};
+      Object.keys(updateData).forEach((key) => {
+        if (allowedUpdates.includes(key)) {
+          sanitizedData[key] = updateData[key];
+        }
+      });
+
+      if (sanitizedData.orderStatus === "CLOSED" && !sanitizedData.closingDate) {
+        sanitizedData.closingDate = new Date();
       }
-    });
+      if (sanitizedData.closingPrice) {
+        sanitizedData.price = sanitizedData.closingPrice;
+      }
 
-    if (sanitizedData.orderStatus === "CLOSED" && !sanitizedData.closingDate) {
-      sanitizedData.closingDate = new Date();
-    }
-    if (sanitizedData.closingPrice) {
-      sanitizedData.price = sanitizedData.closingPrice;
-    }
+      const order = await Order.findOne({ _id: orderId, adminId }).session(
+        mongoSession
+      );
+      if (!order) {
+        throw new Error("Order not found or unauthorized");
+      }
 
-    const order = await Order.findOne({ _id: orderId, adminId }).session(
-      mongoSession
-    );
-    if (!order) {
-      throw new Error("Order not found or unauthorized");
-    }
+      const userAccount = await Account.findById(order.user).session(
+        mongoSession
+      );
+      if (!userAccount) {
+        throw new Error("User account not found");
+      }
 
-    const userAccount = await Account.findById(order.user).session(
-      mongoSession
-    );
-    if (!userAccount) {
-      throw new Error("User account not found");
-    }
+      const askSpread = parseFloat(userAccount.askSpread) || 0;
+      const bidSpread = parseFloat(userAccount.bidSpread) || 0;
 
-    const askSpread = parseFloat(userAccount.askSpread) || 0;
-    const bidSpread = parseFloat(userAccount.bidSpread) || 0;
+      let mt5ClosingPrice = null; // USD per oz
+      let clientClosingPrice = null; // AED for total grams
 
-    let mt5ClosingPrice = null; // USD per oz
-    let clientClosingPrice = null; // AED for total grams
+      if (
+        sanitizedData.orderStatus === "CLOSED" &&
+        order.orderStatus !== "CLOSED"
+      ) {
+        try {
+          const mt5Symbol = SYMBOL_MAPPING[order.symbol] || order.symbol;
+          const validatedSymbol = await mt5Service.validateSymbol(mt5Symbol);
 
-    if (
-      sanitizedData.orderStatus === "CLOSED" &&
-      order.orderStatus !== "CLOSED"
-    ) {
-      try {
-        const mt5Symbol = SYMBOL_MAPPING[order.symbol] || order.symbol;
-        const validatedSymbol = await mt5Service.validateSymbol(mt5Symbol);
+          const mt5CloseData = {
+            ticket: order.ticket,
+            symbol: validatedSymbol,
+            volume: parseFloat(order.volume),
+            type: order.type === "BUY" ? "SELL" : "BUY",
+            openingPrice: parseFloat(order.price),
+          };
 
-        const mt5CloseData = {
-          ticket: order.ticket,
-          symbol: validatedSymbol,
-          volume: parseFloat(order.volume),
-          type: order.type === "BUY" ? "SELL" : "BUY",
-          openingPrice: parseFloat(order.price),
-        };
+          const mt5CloseResult = await mt5Service.closeTrade(mt5CloseData);
 
-        const mt5CloseResult = await mt5Service.closeTrade(mt5CloseData);
+          if (!mt5CloseResult.success) {
+            if (
+              mt5CloseResult.error.includes("Position not found") ||
+              mt5CloseResult.likelyClosed
+            ) {
+              const priceData = await mt5Service.getPrice(validatedSymbol);
+              if (priceData && priceData.bid && priceData.ask) {
+                mt5ClosingPrice =
+                  order.type === "BUY"
+                    ? parseFloat(priceData.bid)
+                    : parseFloat(priceData.ask);
+              } else {
+                mt5ClosingPrice =
+                  parseFloat(order.openingPrice) / GRAMS_PER_BAR[order.symbol];
+              }
+            } else {
+              throw new Error(
+                `MT5 trade closure failed: ${mt5CloseResult.error}`
+              );
+            }
+          } else {
+            mt5ClosingPrice = parseFloat(
+              mt5CloseResult.closePrice || mt5CloseResult.data?.price
+            );
+          }
 
-        if (!mt5CloseResult.success) {
+          // Calculate client closing price
+          const grams = order.volume / GRAMS_PER_BAR[order.symbol];
+          let clientUSDPerOz =
+            order.type === "BUY"
+              ? mt5ClosingPrice - bidSpread
+              : mt5ClosingPrice + askSpread;
+          clientClosingPrice =
+            order.symbol === "TTBAR"
+              ? clientUSDPerOz * CONVERSION_FACTORS.TTBAR * grams
+              : clientUSDPerOz * CONVERSION_FACTORS.KGBAR * grams;
+
+          sanitizedData.closingPrice = clientClosingPrice.toFixed(2);
+          sanitizedData.price = clientClosingPrice.toFixed(2);
+        } catch (mt5Error) {
+          console.error(`Failed to close MT5 trade: ${mt5Error.message}`);
           if (
-            mt5CloseResult.error.includes("Position not found") ||
-            mt5CloseResult.likelyClosed
+            mt5Error.message.includes("Position not found") ||
+            mt5Error.message.includes("Request failed with status code 400")
           ) {
-            const priceData = await mt5Service.getPrice(validatedSymbol);
+            const priceData = await mt5Service.getPrice(
+              SYMBOL_MAPPING[order.symbol] || order.symbol
+            );
             if (priceData && priceData.bid && priceData.ask) {
               mt5ClosingPrice =
                 order.type === "BUY"
                   ? parseFloat(priceData.bid)
                   : parseFloat(priceData.ask);
+              const grams = order.volume / GRAMS_PER_BAR[order.symbol];
+              let clientUSDPerOz =
+                order.type === "BUY"
+                  ? mt5ClosingPrice - bidSpread
+                  : mt5ClosingPrice + askSpread;
+              clientClosingPrice =
+                order.symbol === "TTBAR"
+                  ? clientUSDPerOz * CONVERSION_FACTORS.TTBAR * grams
+                  : clientUSDPerOz * CONVERSION_FACTORS.KGBAR * grams;
+              sanitizedData.closingPrice = clientClosingPrice.toFixed(2);
+              sanitizedData.price = clientClosingPrice.toFixed(2);
             } else {
               mt5ClosingPrice =
                 parseFloat(order.openingPrice) / GRAMS_PER_BAR[order.symbol];
+              clientClosingPrice = parseFloat(order.openingPrice);
+              sanitizedData.closingPrice = clientClosingPrice.toFixed(2);
+              sanitizedData.price = clientClosingPrice.toFixed(2);
             }
           } else {
-            throw new Error(
-              `MT5 trade closure failed: ${mt5CloseResult.error}`
-            );
+            throw mt5Error;
           }
-        } else {
-          mt5ClosingPrice = parseFloat(
-            mt5CloseResult.closePrice || mt5CloseResult.data?.price
-          );
         }
+      }
 
-        // Calculate client closing price
-        const grams = order.volume / GRAMS_PER_BAR[order.symbol];
-        let clientUSDPerOz =
+      if (!clientClosingPrice && sanitizedData.closingPrice) {
+        clientClosingPrice = parseFloat(sanitizedData.closingPrice);
+      }
+
+      let clientProfit = 0;
+      if (clientClosingPrice) {
+        const entryGoldWeightValue = parseFloat(order.openingPrice);
+        const closingGoldWeightValue = clientClosingPrice;
+        clientProfit =
           order.type === "BUY"
-            ? mt5ClosingPrice - bidSpread
-            : mt5ClosingPrice + askSpread;
-        clientClosingPrice =
-          order.symbol === "TTBAR"
-            ? clientUSDPerOz * CONVERSION_FACTORS.TTBAR * grams
-            : clientUSDPerOz * CONVERSION_FACTORS.KGBAR * grams;
+            ? closingGoldWeightValue - entryGoldWeightValue
+            : entryGoldWeightValue - closingGoldWeightValue;
+      }
 
-        sanitizedData.closingPrice = clientClosingPrice.toFixed(2);
-        sanitizedData.price = clientClosingPrice.toFixed(2);
-      } catch (mt5Error) {
-        console.error(`Failed to close MT5 trade: ${mt5Error.message}`);
-        if (
-          mt5Error.message.includes("Position not found") ||
-          mt5Error.message.includes("Request failed with status code 400")
-        ) {
-          const priceData = await mt5Service.getPrice(
-            SYMBOL_MAPPING[order.symbol] || order.symbol
-          );
-          if (priceData && priceData.bid && priceData.ask) {
-            mt5ClosingPrice =
-              order.type === "BUY"
-                ? parseFloat(priceData.bid)
-                : parseFloat(priceData.ask);
-            const grams = order.volume / GRAMS_PER_BAR[order.symbol];
-            let clientUSDPerOz =
-              order.type === "BUY"
-                ? mt5ClosingPrice - bidSpread
-                : mt5ClosingPrice + askSpread;
-            clientClosingPrice =
-              order.symbol === "TTBAR"
-                ? clientUSDPerOz * CONVERSION_FACTORS.TTBAR * grams
-                : clientUSDPerOz * CONVERSION_FACTORS.KGBAR * grams;
-            sanitizedData.closingPrice = clientClosingPrice.toFixed(2);
-            sanitizedData.price = clientClosingPrice.toFixed(2);
-          } else {
-            mt5ClosingPrice =
-              parseFloat(order.openingPrice) / GRAMS_PER_BAR[order.symbol];
-            clientClosingPrice = parseFloat(order.openingPrice);
-            sanitizedData.closingPrice = clientClosingPrice.toFixed(2);
-            sanitizedData.price = clientClosingPrice.toFixed(2);
-          }
-        } else {
-          throw mt5Error;
+      let newCashBalance = parseFloat(userAccount.reservedAmount);
+      let newMetalBalance = parseFloat(userAccount.METAL_WT);
+      let newAMOUNTFC = parseFloat(userAccount.AMOUNTFC || 0);
+      const currentCashBalance = newCashBalance;
+      const currentMetalBalance = newMetalBalance;
+      const currentAMOUNTFC = newAMOUNTFC;
+
+      Object.keys(sanitizedData).forEach((key) => {
+        order[key] = sanitizedData[key];
+      });
+
+      if (sanitizedData.orderStatus === "CLOSED") {
+        order.profit = clientProfit.toFixed(2);
+      }
+
+      await order.save({ session: mongoSession });
+
+      let lpProfit = 0;
+      const lpPosition = await LPPosition.findOne({
+        positionId: order.orderNo,
+      }).session(mongoSession);
+
+      if (lpPosition) {
+        let lpClosingPrice = null;
+        const grams = order.volume / GRAMS_PER_BAR[order.symbol];
+        if (mt5ClosingPrice !== null) {
+          lpClosingPrice =
+            order.symbol === "TTBAR"
+              ? mt5ClosingPrice * CONVERSION_FACTORS.TTBAR * grams
+              : mt5ClosingPrice * CONVERSION_FACTORS.KGBAR * grams;
+          lpPosition.closingPrice = lpClosingPrice.toFixed(2);
+          lpPosition.currentPrice = lpClosingPrice.toFixed(2);
+        } else if (sanitizedData.closingPrice) {
+          lpClosingPrice = parseFloat(sanitizedData.closingPrice);
+          lpPosition.closingPrice = lpClosingPrice.toFixed(2);
+          lpPosition.currentPrice = lpClosingPrice.toFixed(2);
         }
-      }
-    }
 
-    if (!clientClosingPrice && sanitizedData.closingPrice) {
-      clientClosingPrice = parseFloat(sanitizedData.closingPrice);
-    }
+        if (sanitizedData.closingDate) {
+          lpPosition.closeDate = sanitizedData.closingDate;
+        }
 
-    let clientProfit = 0;
-    if (clientClosingPrice) {
-      const entryGoldWeightValue = parseFloat(order.openingPrice);
-      const closingGoldWeightValue = clientClosingPrice;
-      clientProfit =
-        order.type === "BUY"
-          ? closingGoldWeightValue - entryGoldWeightValue
-          : entryGoldWeightValue - closingGoldWeightValue;
-    }
+        if (sanitizedData.orderStatus === "CLOSED") {
+          lpPosition.status = "CLOSED";
 
-    let newCashBalance = parseFloat(userAccount.reservedAmount);
-    let newMetalBalance = parseFloat(userAccount.METAL_WT);
-    let newAMOUNTFC = parseFloat(userAccount.AMOUNTFC || 0);
-    const currentCashBalance = newCashBalance;
-    const currentMetalBalance = newMetalBalance;
-    const currentAMOUNTFC = newAMOUNTFC;
+          const lpEntryGoldWeightValue = parseFloat(lpPosition.entryPrice);
+          const lpClosingGoldWeightValue =
+            lpClosingPrice || parseFloat(sanitizedData.closingPrice);
+          const entryGoldWeightValue = parseFloat(order.openingPrice);
+          const closingGoldWeightValue = clientClosingPrice;
 
-    Object.keys(sanitizedData).forEach((key) => {
-      order[key] = sanitizedData[key];
-    });
+          const openingDifference = Math.abs(
+            lpEntryGoldWeightValue - entryGoldWeightValue
+          );
+          const closingDifference = Math.abs(
+            lpClosingGoldWeightValue - closingGoldWeightValue
+          );
+          lpProfit = openingDifference + closingDifference;
 
-    if (sanitizedData.orderStatus === "CLOSED") {
-      order.profit = clientProfit.toFixed(2);
-    }
+          lpPosition.profit = lpProfit.toFixed(2);
+        }
 
-    await order.save({ session: mongoSession });
-
-    let lpProfit = 0;
-    const lpPosition = await LPPosition.findOne({
-      positionId: order.orderNo,
-    }).session(mongoSession);
-
-    if (lpPosition) {
-      let lpClosingPrice = null;
-      const grams = order.volume / GRAMS_PER_BAR[order.symbol];
-      if (mt5ClosingPrice !== null) {
-        lpClosingPrice =
-          order.symbol === "TTBAR"
-            ? mt5ClosingPrice * CONVERSION_FACTORS.TTBAR * grams
-            : mt5ClosingPrice * CONVERSION_FACTORS.KGBAR * grams;
-        lpPosition.closingPrice = lpClosingPrice.toFixed(2);
-        lpPosition.currentPrice = lpClosingPrice.toFixed(2);
-      } else if (sanitizedData.closingPrice) {
-        lpClosingPrice = parseFloat(sanitizedData.closingPrice);
-        lpPosition.closingPrice = lpClosingPrice.toFixed(2);
-        lpPosition.currentPrice = lpClosingPrice.toFixed(2);
-      }
-
-      if (sanitizedData.closingDate) {
-        lpPosition.closeDate = sanitizedData.closingDate;
+        await lpPosition.save({ session: mongoSession });
       }
 
       if (sanitizedData.orderStatus === "CLOSED") {
-        lpPosition.status = "CLOSED";
+        const lpProfitRecord = await LPProfit.findOne({
+          orderNo: order.orderNo,
+          status: "OPEN",
+        }).session(mongoSession);
 
-        const lpEntryGoldWeightValue = parseFloat(lpPosition.entryPrice);
-        const lpClosingGoldWeightValue =
-          lpClosingPrice || parseFloat(sanitizedData.closingPrice);
-        const entryGoldWeightValue = parseFloat(order.openingPrice);
-        const closingGoldWeightValue = clientClosingPrice;
+        if (lpProfitRecord) {
+          const gramValue = CONVERSION_FACTORS[order.symbol];
+          const grams = order.volume / GRAMS_PER_BAR[order.symbol];
+          const closingLPProfitValue =
+            order.type === "BUY"
+              ? gramValue * grams * bidSpread
+              : gramValue * grams * askSpread;
 
-        const openingDifference = Math.abs(
-          lpEntryGoldWeightValue - entryGoldWeightValue
+          const totalLPProfit =
+            parseFloat(lpProfitRecord.value) + closingLPProfitValue;
+          lpProfitRecord.status = "CLOSED";
+          lpProfitRecord.value = totalLPProfit.toFixed(2);
+          lpProfitRecord.datetime = new Date(sanitizedData.closingDate);
+
+          await lpProfitRecord.save({ session: mongoSession });
+        }
+      }
+
+      if (sanitizedData.orderStatus === "CLOSED") {
+        const settlementAmount = parseFloat(order.requiredMargin || 0);
+        const userProfit = clientProfit > 0 ? clientProfit : 0;
+
+        if (order.type === "BUY") {
+          newCashBalance = currentCashBalance + settlementAmount + clientProfit;
+          newAMOUNTFC = currentAMOUNTFC + clientProfit;
+          newMetalBalance =
+            currentMetalBalance - order.volume / GRAMS_PER_BAR[order.symbol];
+        } else if (order.type === "SELL") {
+          newCashBalance = currentCashBalance + settlementAmount + clientProfit;
+          newAMOUNTFC = currentAMOUNTFC + clientProfit;
+          newMetalBalance =
+            currentMetalBalance + order.volume / GRAMS_PER_BAR[order.symbol];
+        }
+
+        await Account.findByIdAndUpdate(
+          order.user,
+          {
+            reservedAmount: newCashBalance.toFixed(2),
+            METAL_WT: newMetalBalance.toFixed(2),
+            AMOUNTFC: newAMOUNTFC.toFixed(2),
+          },
+          { session: mongoSession, new: true }
         );
-        const closingDifference = Math.abs(
-          lpClosingGoldWeightValue - closingGoldWeightValue
-        );
-        lpProfit = openingDifference + closingDifference;
 
-        lpPosition.profit = lpProfit.toFixed(2);
-      }
-
-      await lpPosition.save({ session: mongoSession });
-    }
-
-    if (sanitizedData.orderStatus === "CLOSED") {
-      const lpProfitRecord = await LPProfit.findOne({
-        orderNo: order.orderNo,
-        status: "OPEN",
-      }).session(mongoSession);
-
-      if (lpProfitRecord) {
-        const gramValue = CONVERSION_FACTORS[order.symbol];
-        const grams = order.volume / GRAMS_PER_BAR[order.symbol];
-        const closingLPProfitValue =
-          order.type === "BUY"
-            ? gramValue * grams * bidSpread
-            : gramValue * grams * askSpread;
-
-        const totalLPProfit =
-          parseFloat(lpProfitRecord.value) + closingLPProfitValue;
-        lpProfitRecord.status = "CLOSED";
-        lpProfitRecord.value = totalLPProfit.toFixed(2);
-        lpProfitRecord.datetime = new Date(sanitizedData.closingDate);
-
-        await lpProfitRecord.save({ session: mongoSession });
-      }
-    }
-
-    if (sanitizedData.orderStatus === "CLOSED") {
-      const settlementAmount = parseFloat(order.requiredMargin || 0);
-      const userProfit = clientProfit > 0 ? clientProfit : 0;
-
-      if (order.type === "BUY") {
-        newCashBalance = currentCashBalance + settlementAmount + clientProfit;
-        newAMOUNTFC = currentAMOUNTFC + clientProfit;
-        newMetalBalance =
-          currentMetalBalance - order.volume / GRAMS_PER_BAR[order.symbol];
-      } else if (order.type === "SELL") {
-        newCashBalance = currentCashBalance + settlementAmount + clientProfit;
-        newAMOUNTFC = currentAMOUNTFC + clientProfit;
-        newMetalBalance =
-          currentMetalBalance + order.volume / GRAMS_PER_BAR[order.symbol];
-      }
-
-      await Account.findByIdAndUpdate(
-        order.user,
-        {
-          reservedAmount: newCashBalance.toFixed(2),
-          METAL_WT: newMetalBalance.toFixed(2),
-          AMOUNTFC: newAMOUNTFC.toFixed(2),
-        },
-        { session: mongoSession, new: true }
-      );
-
-      const orderLedgerEntry = new Ledger({
-        entryId: generateEntryId("ORD"),
-        entryType: "ORDER",
-        referenceNumber: order.orderNo,
-        description: `Closing ${order.type} ${order.volume} ${
-          order.symbol
-        } @ ${(
-          clientClosingPrice /
-          (order.volume / GRAMS_PER_BAR[order.symbol])
-        ).toFixed(2)}${userProfit > 0 ? " with profit" : ""}`,
-        amount: (settlementAmount + userProfit).toFixed(2),
-        entryNature: "CREDIT",
-        runningBalance: newCashBalance.toFixed(2),
-        orderDetails: {
-          type: order.type,
-          symbol: order.symbol,
-          volume: order.volume,
-          entryPrice:
-            parseFloat(order.openingPrice) /
-            (order.volume / GRAMS_PER_BAR[order.symbol]),
-          closingPrice:
-            clientClosingPrice / (order.volume / GRAMS_PER_BAR[order.symbol]),
-          profit: clientProfit.toFixed(2),
-          status: "CLOSED",
-        },
-        user: order.user,
-        adminId: adminId,
-        date: new Date(sanitizedData.closingDate),
-      });
-      await orderLedgerEntry.save({ session: mongoSession });
-
-      if (lpPosition) {
-        const lpClosingPrice = mt5ClosingPrice
-          ? (order.symbol === "TTBAR"
-              ? mt5ClosingPrice * CONVERSION_FACTORS.TTBAR
-              : mt5ClosingPrice * CONVERSION_FACTORS.KGBAR) *
-            (order.volume / GRAMS_PER_BAR[order.symbol])
-          : clientClosingPrice;
-
-        const lpLedgerEntry = new Ledger({
-          entryId: generateEntryId("LP"),
-          entryType: "LP_POSITION",
+        const orderLedgerEntry = new Ledger({
+          entryId: generateEntryId("ORD"),
+          entryType: "ORDER",
           referenceNumber: order.orderNo,
-          description: `LP Position closed for ${order.type} ${order.volume} ${
+          description: `Closing ${order.type} ${order.volume} ${
             order.symbol
           } @ ${(
-            lpClosingPrice /
+            clientClosingPrice /
             (order.volume / GRAMS_PER_BAR[order.symbol])
-          ).toFixed(2)}`,
-          amount: settlementAmount.toFixed(2),
-          entryNature: "DEBIT",
+          ).toFixed(2)}${userProfit > 0 ? " with profit" : ""}`,
+          amount: (settlementAmount + userProfit).toFixed(2),
+          entryNature: "CREDIT",
           runningBalance: newCashBalance.toFixed(2),
-          lpDetails: {
-            positionId: order.orderNo,
+          orderDetails: {
             type: order.type,
             symbol: order.symbol,
             volume: order.volume,
             entryPrice:
-              parseFloat(lpPosition.entryPrice) /
+              parseFloat(order.openingPrice) /
               (order.volume / GRAMS_PER_BAR[order.symbol]),
             closingPrice:
-              lpClosingPrice / (order.volume / GRAMS_PER_BAR[order.symbol]),
-            profit: lpProfit.toFixed(2),
+              clientClosingPrice / (order.volume / GRAMS_PER_BAR[order.symbol]),
+            profit: clientProfit.toFixed(2),
             status: "CLOSED",
           },
           user: order.user,
           adminId: adminId,
           date: new Date(sanitizedData.closingDate),
         });
-        await lpLedgerEntry.save({ session: mongoSession });
+        await orderLedgerEntry.save({ session: mongoSession });
+
+        if (lpPosition) {
+          const lpClosingPrice = mt5ClosingPrice
+            ? (order.symbol === "TTBAR"
+                ? mt5ClosingPrice * CONVERSION_FACTORS.TTBAR
+                : mt5ClosingPrice * CONVERSION_FACTORS.KGBAR) *
+              (order.volume / GRAMS_PER_BAR[order.symbol])
+            : clientClosingPrice;
+
+          const lpLedgerEntry = new Ledger({
+            entryId: generateEntryId("LP"),
+            entryType: "LP_POSITION",
+            referenceNumber: order.orderNo,
+            description: `LP Position closed for ${order.type} ${order.volume} ${
+              order.symbol
+            } @ ${(
+              lpClosingPrice /
+              (order.volume / GRAMS_PER_BAR[order.symbol])
+            ).toFixed(2)}`,
+            amount: settlementAmount.toFixed(2),
+            entryNature: "DEBIT",
+            runningBalance: newCashBalance.toFixed(2),
+            lpDetails: {
+              positionId: order.orderNo,
+              type: order.type,
+              symbol: order.symbol,
+              volume: order.volume,
+              entryPrice:
+                parseFloat(lpPosition.entryPrice) /
+                (order.volume / GRAMS_PER_BAR[order.symbol]),
+              closingPrice:
+                lpClosingPrice / (order.volume / GRAMS_PER_BAR[order.symbol]),
+              profit: lpProfit.toFixed(2),
+              status: "CLOSED",
+            },
+            user: order.user,
+            adminId: adminId,
+            date: new Date(sanitizedData.closingDate),
+          });
+          await lpLedgerEntry.save({ session: mongoSession });
+        }
+
+        const cashTransactionLedgerEntry = new Ledger({
+          entryId: generateEntryId("TRX"),
+          entryType: "TRANSACTION",
+          referenceNumber: order.orderNo,
+          description: `Cash settlement for closing trade ${order.orderNo}`,
+          amount: settlementAmount.toFixed(2),
+          entryNature: "CREDIT",
+          runningBalance: newCashBalance.toFixed(2),
+          transactionDetails: {
+            type: null,
+            asset: "CASH",
+            previousBalance: currentCashBalance,
+          },
+          user: order.user,
+          adminId: adminId,
+          date: new Date(sanitizedData.closingDate),
+          notes: `Cash settlement for closed ${order.type} order on ${order.symbol}`,
+        });
+        await cashTransactionLedgerEntry.save({ session: mongoSession });
+
+        const amountFCLedgerEntry = new Ledger({
+          entryId: generateEntryId("TRX"),
+          entryType: "TRANSACTION",
+          referenceNumber: order.orderNo,
+          description: `AMOUNTFC ${
+            clientProfit >= 0 ? "profit" : "loss"
+          } for closing trade ${order.orderNo}`,
+          amount: Math.abs(clientProfit).toFixed(2),
+          entryNature: clientProfit >= 0 ? "CREDIT" : "DEBIT",
+          runningBalance: newAMOUNTFC.toFixed(2),
+          transactionDetails: {
+            type: null,
+            asset: "CASH",
+            previousBalance: currentAMOUNTFC,
+          },
+          user: order.user,
+          adminId: adminId,
+          date: new Date(sanitizedData.closingDate),
+          notes: `AMOUNTFC updated with ${
+            clientProfit >= 0 ? "profit" : "loss"
+          } from closed ${order.type} order`,
+        });
+        await amountFCLedgerEntry.save({ session: mongoSession });
       }
 
-      const cashTransactionLedgerEntry = new Ledger({
-        entryId: generateEntryId("TRX"),
-        entryType: "TRANSACTION",
-        referenceNumber: order.orderNo,
-        description: `Cash settlement for closing trade ${order.orderNo}`,
-        amount: settlementAmount.toFixed(2),
-        entryNature: "CREDIT",
-        runningBalance: newCashBalance.toFixed(2),
-        transactionDetails: {
-          type: null,
-          asset: "CASH",
-          previousBalance: currentCashBalance,
-        },
-        user: order.user,
-        adminId: adminId,
-        date: new Date(sanitizedData.closingDate),
-        notes: `Cash settlement for closed ${order.type} order on ${order.symbol}`,
-      });
-      await cashTransactionLedgerEntry.save({ session: mongoSession });
-
-      const amountFCLedgerEntry = new Ledger({
-        entryId: generateEntryId("TRX"),
-        entryType: "TRANSACTION",
-        referenceNumber: order.orderNo,
-        description: `AMOUNTFC ${
-          clientProfit >= 0 ? "profit" : "loss"
-        } for closing trade ${order.orderNo}`,
-        amount: Math.abs(clientProfit).toFixed(2),
-        entryNature: clientProfit >= 0 ? "CREDIT" : "DEBIT",
-        runningBalance: newAMOUNTFC.toFixed(2),
-        transactionDetails: {
-          type: null,
-          asset: "CASH",
-          previousBalance: currentAMOUNTFC,
-        },
-        user: order.user,
-        adminId: adminId,
-        date: new Date(sanitizedData.closingDate),
-        notes: `AMOUNTFC updated with ${
-          clientProfit >= 0 ? "profit" : "loss"
-        } from closed ${order.type} order`,
-      });
-      await amountFCLedgerEntry.save({ session: mongoSession });
-    }
-
-    if (!session) {
-      await mongoSession.commitTransaction();
-      committed = true;
-      mongoSession.endSession();
-      sessionEnded = true;
-    }
-
-    return {
-      order,
-      balances: {
-        cash: newCashBalance,
-        gold: newMetalBalance,
-        AMOUNTFC: newAMOUNTFC,
-      },
-      profit: {
-        client: clientProfit,
-        lp: lpPosition ? parseFloat(lpPosition.profit) : 0,
-      },
-      closingPrices: {
-        mt5ClosingPrice: mt5ClosingPrice,
-        clientClosingPrice: clientClosingPrice,
-        spreadApplied: order.type === "BUY" ? bidSpread : askSpread,
-      },
-    };
-  } catch (error) {
-    if (!committed && !session) {
-      try {
-        await mongoSession.abortTransaction();
-      } catch (abortError) {
-        console.error(
-          `Failed to abort transaction for orderId ${orderId}: ${abortError.message}`
-        );
-      }
-    }
-    console.error(
-      `Trade update error for orderId ${orderId}: ${error.message}, Stack: ${error.stack}`
-    );
-    throw new Error(`Error updating trade: ${error.message}`);
-  } finally {
-    if (!session && !sessionEnded) {
-      try {
+      if (!session) {
+        await mongoSession.commitTransaction();
+        committed = true;
         mongoSession.endSession();
-      } catch (endError) {
-        console.error(
-          `Failed to end session for orderId ${orderId}: ${endError.message}`
-        );
+        sessionEnded = true;
+      }
+
+      return {
+        order,
+        balances: {
+          cash: newCashBalance,
+          gold: newMetalBalance,
+          AMOUNTFC: newAMOUNTFC,
+        },
+        profit: {
+          client: clientProfit,
+          lp: lpPosition ? parseFloat(lpPosition.profit) : 0,
+        },
+        closingPrices: {
+          mt5ClosingPrice: mt5ClosingPrice,
+          clientClosingPrice: clientClosingPrice,
+          spreadApplied: order.type === "BUY" ? bidSpread : askSpread,
+        },
+      };
+    } catch (error) {
+      if (!committed && !session) {
+        try {
+          await mongoSession.abortTransaction();
+        } catch (abortError) {
+          console.error(
+            `Failed to abort transaction for orderId ${orderId}: ${abortError.message}`
+          );
+        }
+      }
+      console.error(
+        `Trade update error for orderId ${orderId}: ${error.message}, Stack: ${error.stack}`
+      );
+      throw new Error(`Error updating trade: ${error.message}`);
+    } finally {
+      if (!session && !sessionEnded) {
+        try {
+          mongoSession.endSession();
+        } catch (endError) {
+          console.error(
+            `Failed to end session for orderId ${orderId}: ${endError.message}`
+          );
+        }
       }
     }
-  }
-};
+  };
