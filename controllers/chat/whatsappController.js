@@ -546,13 +546,13 @@ export const handleVolumeInputMT5 = async (
     const adjustedPrice =
       session.pendingOrder.type === "BUY"
         ? (
-            marketData?.ask * CONVERSION_FACTORS[symbol] +
-            (account.askSpread || 0)
-          ).toFixed(2)
+          marketData?.ask * CONVERSION_FACTORS[symbol] +
+          (account.askSpread || 0)
+        ).toFixed(2)
         : (
-            marketData?.bid * CONVERSION_FACTORS[symbol] -
-            (account.bidSpread || 0)
-          ).toFixed(2);
+          marketData?.bid * CONVERSION_FACTORS[symbol] -
+          (account.bidSpread || 0)
+        ).toFixed(2);
     return `❌ Invalid volume. >0 (e.g., 0.1 ${unit.toLowerCase()})\n\n📈 ${typePrefix} ${symbol} at AED ${adjustedPrice}/${unit}\nVolume:`;
   }
 
@@ -645,10 +645,10 @@ export const handleOrderConfirmationMT5 = async (
 
         const actualExecutionPrice = parseFloat(mt5Result.price);
         const clientPricePerGram =
-        (actualExecutionPrice +
-          (orderType === "BUY" ? accountDoc.askSpread : -accountDoc.bidSpread)) *
-        CONVERSION_FACTORS[symbol] *
-        volume;
+          (actualExecutionPrice +
+            (orderType === "BUY" ? accountDoc.askSpread : -accountDoc.bidSpread)) *
+          CONVERSION_FACTORS[symbol] *
+          volume;
 
         console.log(clientPricePerGram);
         console.log(actualExecutionPrice);
@@ -768,49 +768,65 @@ export const handlePositionSelectionMT5 = async (
       if (order.orderStatus === "CLOSED")
         throw new Error(`Order ${selectedPosition.ticket} is already closed`);
 
-      // Fallback: Close position by placing an opposite trade
-      const closeTradeData = {
-        symbol: SYMBOL_MAPPING[symbol],
-        volume: selectedPosition.volume , // Convert back to grams
-        type: selectedPosition.type === "BUY" ? "SELL" : "BUY", // Opposite type
-        slDistance: null,
-        tpDistance: null,
-        comment: `Close-${selectedPosition.ticket}`,
-        magic: 123456,
-      };
-
+      // Close the position using MT5 closeTrade function
       let closeResult;
       try {
-        // Try closePosition if available
-        if (typeof mt5Service.closePosition === "function") {
-          closeResult = await mt5Service.closePosition({
-            ticket: selectedPosition.ticket,
-            symbol: SYMBOL_MAPPING[symbol],
-            volume: selectedPosition.volume,
-            type: selectedPosition.type === "BUY" ? "SELL" : "BUY",
-          });
-        } else {
-          // Fallback to placeTrade
-          closeResult = await mt5Service.placeTrade(closeTradeData);
+        // Use the proper closeTrade method that closes the position
+        const mt5Symbol = SYMBOL_MAPPING[symbol] || symbol;
+        const validatedSymbol = await mt5Service.validateSymbol(mt5Symbol);
+
+        const mt5CloseData = {
+          ticket: selectedPosition.ticket,
+          symbol: validatedSymbol,
+          volume: parseFloat(selectedPosition.volume),
+          type: selectedPosition.type === "BUY" ? "SELL" : "BUY", // Opposite type to close
+          openingPrice: parseFloat(selectedPosition.price_open),
+        };
+
+        closeResult = await mt5Service.closeTrade(mt5CloseData);
+
+        // Handle position already closed or not found
+        if (!closeResult.success) {
+          if (
+            closeResult.error.includes("Position not found") ||
+            closeResult.likelyClosed
+          ) {
+            // Position already closed, get current price for calculation
+            const priceData = await mt5Service.getPrice(validatedSymbol);
+            if (priceData && priceData.bid && priceData.ask) {
+              const mt5ClosingPrice =
+                selectedPosition.type === "BUY"
+                  ? parseFloat(priceData.bid)
+                  : parseFloat(priceData.ask);
+              
+              closeResult = {
+                success: true,
+                price: mt5ClosingPrice,
+                volume: selectedPosition.volume,
+                closePrice: mt5ClosingPrice,
+              };
+            } else {
+              throw new Error("Unable to get closing price for already closed position");
+            }
+          } else {
+            throw new Error(`MT5 close failed: ${closeResult.error}`);
+          }
         }
       } catch (closeError) {
         console.error(`MT5 close error: ${closeError.message}`);
         throw new Error(`Failed to close position: ${closeError.message}`);
       }
 
-      if (!closeResult.success || !closeResult.price) {
+      if (!closeResult.success || (!closeResult.price && !closeResult.closePrice)) {
         throw new Error(closeResult.error || "Failed to close position in MT5");
       }
-     const grams = parseFloat(closeResult.volume) / GRAMS_PER_BAR[symbol];
-     console.log(grams)
-      const closingPrice =
-        parseFloat(closeResult.price) * CONVERSION_FACTORS[symbol] * grams;
-      // const openPrice =
-      //   selectedPosition.price_open * CONVERSION_FACTORS[symbol];
-      // const profit =
-      //   selectedPosition.type === "BUY"
-      //     ? (closingPrice - openPrice) * selectedPosition.volume
-      //     : (openPrice - closingPrice) * selectedPosition.volume;
+
+      const grams = parseFloat(selectedPosition.volume) / GRAMS_PER_BAR[symbol];
+      console.log(`Closing grams: ${grams}`);
+      
+      // Get the actual closing price from MT5 response
+      const mt5Price = parseFloat(closeResult.closePrice || closeResult.price);
+      const closingPrice = mt5Price * CONVERSION_FACTORS[symbol] * grams;
 
       const updateData = {
         orderStatus: "CLOSED",
@@ -818,28 +834,54 @@ export const handlePositionSelectionMT5 = async (
         closingDate: new Date(),
       };
 
+      // updateTradeStatus returns the complete trade info including calculated profit
       const updatedOrder = await updateTradeStatus(
         adminId,
         order._id.toString(),
         updateData,
         mongoSession
       );
-      return { updatedOrder, closingPrice, profit, openPrice };
+
+      // Extract values from updateTradeStatus response
+      const clientProfit = updatedOrder.profit.client;
+      const openingPrice = parseFloat(order.openingPrice);
+
+      return { 
+        updatedOrder, 
+        closingPrice, 
+        openingPrice,
+        profit: clientProfit 
+      };
     });
 
     if (!result.success) throw new Error(result.error.message);
 
-    const { updatedOrder, closingPrice, profit, openPrice } = result.result;
+    const { updatedOrder, closingPrice, openingPrice, profit } = result.result;
     session.state = "MAIN_MENU";
     session.openPositions = null;
     updateUserSession(phoneNumber, session);
 
-    // Enhanced, attractive close message
-    return `🎉 Position #${
-      selectedPosition.ticket
-    } Closed! ✅\n📈 Open: AED ${openPrice.toFixed(
-      2
-    )}\n📉 Close: AED ${closingPrice.toFixed(2)}\n\n💬 4=Positions | MENU`;
+    // Calculate per-unit prices for display
+    const grams = selectedPosition.volume / GRAMS_PER_BAR[symbol];
+    const openPricePerUnit = openingPrice / grams;
+    const closePricePerUnit = closingPrice / grams;
+
+    // Enhanced, attractive close message with profit/loss indicator
+    const profitEmoji = profit >= 0 ? "💰" : "📉";
+    const profitText = profit >= 0 ? "Profit" : "Loss";
+    const profitColor = profit >= 0 ? "+" : "";
+
+    return `🎉 Position #${selectedPosition.ticket} Closed! ✅
+
+📊 *Trade Summary*
+━━━━━━━━━━━━━━━━
+📈 Open:  AED ${openPricePerUnit.toFixed(2)}/${unit}
+📉 Close: AED ${closePricePerUnit.toFixed(2)}/${unit}
+${profitEmoji} ${profitText}: ${profitColor}AED ${Math.abs(profit).toFixed(2)}
+
+💰 Total: AED ${closingPrice.toFixed(2)}
+
+💬 4=Positions | MENU`;
   } catch (error) {
     console.error(
       `Position close error for ticket ${selectedPosition.ticket}: ${error.message}`
