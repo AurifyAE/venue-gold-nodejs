@@ -1,7 +1,7 @@
 import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
-const BASE_URL = "https://venuemt5.aurify.ae"; // Adjust to your Python API URL
+const BASE_URL = "https://venuemt5.aurify.ae"; // Your Python API URL
 
 class MT5Service {
   constructor() {
@@ -48,14 +48,13 @@ class MT5Service {
 
   async getSymbolInfo(symbol) {
     try {
-      // Ensure proper URL encoding for special characters like #
       const encodedSymbol = encodeURIComponent(symbol);
       const response = await axios.get(
         `${BASE_URL}/symbol_info/${encodedSymbol}`
       );
       return response.data.data;
     } catch (error) {
-      console.error("Symbol info fetch failed:", error.message);
+      console.error(`Symbol info fetch failed for ${symbol}:`, error.message);
       throw error;
     }
   }
@@ -79,19 +78,139 @@ class MT5Service {
     }
   }
 
+  async getPositions() {
+    try {
+      const response = await axios.get(`${BASE_URL}/positions`);
+      return response.data.data;
+    } catch (error) {
+      console.error("Positions fetch failed:", error.message);
+      throw error;
+    }
+  }
+
+  async validateSymbol(symbol) {
+    try {
+      const symbols = await this.getSymbols();
+      if (symbols.includes(symbol)) {
+        const info = await this.getSymbolInfo(symbol);
+        if (info.trade_mode !== 0) {
+          console.log(
+            `Validated symbol ${symbol} with filling mode: ${info.filling_mode}`
+          );
+          return symbol;
+        }
+        console.warn(`Symbol ${symbol} not tradable`);
+      }
+      const matches = symbols.filter(
+        (s) =>
+          s.toLowerCase().includes(symbol.toLowerCase()) ||
+          s.toLowerCase().includes("xau") ||
+          s.toLowerCase().includes("gold") ||
+          s === process.env.MT5_SYMBOL ||
+          s === "XAUUSD_TTBAR.Fix" ||
+          s === "XAUUSD"
+      );
+      for (const match of matches) {
+        const info = await this.getSymbolInfo(match);
+        if (info.trade_mode !== 0) {
+          console.log(
+            `Alternative symbol ${match} validated with filling mode: ${info.filling_mode}`
+          );
+          return match;
+        }
+      }
+      throw new Error(
+        `Symbol ${symbol} not found or tradable. Alternatives: ${matches.join(
+          ", "
+        )}`
+      );
+    } catch (error) {
+      console.error(`Symbol validation failed for ${symbol}:`, error.message);
+      throw error;
+    }
+  }
+
+  async testConnection() {
+    try {
+      if (!this.isConnected) throw new Error("Not connected");
+      const testResult = await this.getPrice(
+        process.env.MT5_SYMBOL || "XAUUSD_TTBAR.Fix"
+      );
+      console.log("Connection test passed:", testResult);
+      return { success: true, message: "MT5 working", testPrice: testResult };
+    } catch (error) {
+      console.error("Connection test failed:", error);
+      return {
+        success: false,
+        message: "MT5 test failed",
+        error: error.message,
+      };
+    }
+  }
+
+  async checkMarketHours(symbol) {
+    const adminContact = "+971 58 502 3411";
+    try {
+      const validSymbol = await this.validateSymbol(symbol);
+      const info = await this.getSymbolInfo(validSymbol);
+
+      // Check MT5 trade_mode
+      if (info.trade_mode === 0) {
+        return {
+          isOpen: false,
+          error: `⚠️ Market is closed. Please contact our support team at ${adminContact} for assistance.`,
+        };
+      }
+
+      // Fallback: Check forex market hours (Monday 00:00 to Friday 23:59 UTC)
+      const now = new Date();
+      const dubaiOffset = 4 * 60; // Dubai is UTC+4
+      const utcTime = new Date(now.getTime() - dubaiOffset * 60 * 1000);
+      const dayOfWeek = utcTime.getUTCDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+      const hours = utcTime.getUTCHours();
+      const minutes = utcTime.getUTCMinutes();
+      const timeInMinutes = hours * 60 + minutes;
+
+      // Forex market is typically open from Monday 00:00 UTC to Friday 23:59 UTC
+      const isMarketOpen = dayOfWeek >= 1 && dayOfWeek <= 5; // Monday to Friday
+
+      if (!isMarketOpen) {
+        return {
+          isOpen: false,
+          error: `⚠️ Market is closed. Please contact our support team at ${adminContact} for assistance.`,
+        };
+      }
+
+      return { isOpen: true, error: null };
+    } catch (error) {
+      console.error(`Market hours check failed for ${symbol}:`, error.message);
+      return {
+        isOpen: false,
+        error: `⚠️ Market is closed or unavailable. Please contact our support team at ${adminContact} for assistance.`,
+      };
+    }
+  }
+
   async placeTrade(tradeData, retryCount = 0) {
     const maxRetries = 3;
+    const adminContact = "+971 58 502 3411";
     try {
       if (!(await this.testConnection()).success) {
         throw new Error("MT5 connection test failed");
       }
+
+      // Check market hours before placing trade
+      const marketStatus = await this.checkMarketHours(
+        tradeData.symbol || process.env.MT5_SYMBOL || "XAUUSD_TTBAR.Fix"
+      );
+      if (!marketStatus.isOpen) {
+        throw new Error(marketStatus.error);
+      }
+
       const symbol = await this.validateSymbol(
         tradeData.symbol || process.env.MT5_SYMBOL || "XAUUSD_TTBAR.Fix"
       );
       const info = await this.getSymbolInfo(symbol);
-      if (info.trade_mode === 0) {
-        throw new Error(`Symbol ${symbol} is not tradable`);
-      }
 
       let volume = parseFloat(tradeData.volume);
       if (isNaN(volume) || volume < info.volume_min) {
@@ -124,7 +243,7 @@ class MT5Service {
       }
 
       const request = {
-        symbol: symbol, // Use validated symbol with proper encoding
+        symbol: symbol,
         volume: volume,
         type: tradeData.type.toUpperCase(),
         sl_distance: slDistance,
@@ -157,18 +276,22 @@ class MT5Service {
       const errorCode = error.response?.data?.error?.match(/Code: (\d+)/)?.[1];
       const errorMessage = errorCode
         ? {
-            10018: "Market closed",
-            10019: "Insufficient funds",
-            10020: "Prices changed",
-            10021: "Invalid request (check volume, symbol, or market status)",
-            10022: "Invalid SL/TP",
-            10017: "Invalid parameters",
-            10027: "AutoTrading disabled",
-            10030: "Invalid order filling type",
-          }[parseInt(errorCode)] || "Unknown error"
+            10018: `⚠️ Market is closed. Please contact our support team at ${adminContact} for assistance.`,
+            10019: "Insufficient funds. Please check your balance.",
+            10020: "Prices have changed. Please try again.",
+            10021:
+              "Invalid request. Please check volume, symbol, or market status.",
+            10022: "Invalid Stop Loss or Take Profit levels.",
+            10017: "Invalid parameters provided.",
+            10027: "AutoTrading is disabled.",
+            10030: "Invalid order filling type.",
+          }[parseInt(errorCode)] || `Unknown error: ${error.message}`
         : error.message.includes("connection")
-        ? "MT5 connection issue"
-        : error.message;
+        ? `MT5 connection issue. Please contact support at ${adminContact}.`
+        : error.message.includes("Market closed")
+        ? `⚠️ Market is closed. Please contact our support team at ${adminContact} for assistance.`
+        : `Error: ${error.message}. Please contact support at ${adminContact}.`;
+
       if (
         (errorCode === "10020" || errorCode === "10021") &&
         retryCount < maxRetries
@@ -191,6 +314,7 @@ class MT5Service {
 
   async closeTrade(tradeData, retryCount = 0) {
     const maxRetries = 3;
+    const adminContact = "+971 58 502 3411";
     try {
       if (!tradeData.ticket || isNaN(tradeData.ticket)) {
         throw new Error(`Invalid ticket: ${tradeData.ticket}`);
@@ -198,11 +322,15 @@ class MT5Service {
       if (!tradeData.symbol) {
         throw new Error(`Missing symbol`);
       }
+
+      // Check market hours before closing trade
+      const marketStatus = await this.checkMarketHours(tradeData.symbol);
+      if (!marketStatus.isOpen) {
+        throw new Error(marketStatus.error);
+      }
+
       const validSymbol = await this.validateSymbol(tradeData.symbol);
       const info = await this.getSymbolInfo(validSymbol);
-      if (info.trade_mode === 0) {
-        throw new Error(`Symbol ${validSymbol} is not tradable`);
-      }
 
       console.log(`Fetching positions for ticket ${tradeData.ticket}`);
       const positions = await this.getPositions();
@@ -411,21 +539,24 @@ class MT5Service {
         error.response?.data?.error?.match(/-?\d+/)?.[0];
       const errorMessage = errorCode
         ? {
-            10013: "Requote detected",
-            10018: "Market closed",
-            10019: "Insufficient funds",
-            10020: "Prices changed",
-            10021: "Invalid request (check volume, symbol, or market status)",
-            10022: "Invalid SL/TP",
-            10017: "Invalid parameters",
-            10027: "AutoTrading disabled",
+            10013: "Requote detected. Please try again.",
+            10018: `⚠️ Market is closed. Please contact our support team at ${adminContact} for assistance.`,
+            10019: "Insufficient funds. Please check your balance.",
+            10020: "Prices have changed. Please try again.",
+            10021:
+              "Invalid request. Please check volume, symbol, or market status.",
+            10022: "Invalid Stop Loss or Take Profit levels.",
+            10017: "Invalid parameters provided.",
+            10027: "AutoTrading is disabled. Please contact support.",
             "-2": `Invalid volume argument: Requested ${tradeData.volume}`,
           }[errorCode] || `Unknown error: ${error.message}`
         : error.message.includes("connection")
-        ? "MT5 connection issue"
+        ? `MT5 connection issue. Please contact support at ${adminContact}.`
+        : error.message.includes("Market closed")
+        ? `⚠️ Market is closed. Please contact our support team at ${adminContact} for assistance.`
         : error.message.includes("Position not found")
         ? `Position ${tradeData.ticket} not found in MT5`
-        : error.message;
+        : `Error: ${error.message}. Please contact support at ${adminContact}.`;
 
       console.error(
         `Trade close failed for ticket ${tradeData.ticket}: ${errorMessage}, Stack: ${error.stack}`
@@ -436,16 +567,6 @@ class MT5Service {
         ticket: tradeData.ticket,
         likelyClosed: errorMessage.includes("Position not found"),
       };
-    }
-  }
-
-  async getPositions() {
-    try {
-      const response = await axios.get(`${BASE_URL}/positions`);
-      return response.data.data;
-    } catch (error) {
-      console.error("Positions fetch failed:", error.message);
-      throw error;
     }
   }
 
@@ -461,61 +582,6 @@ class MT5Service {
       this.lastPriceUpdate.get(symbol) &&
       Date.now() - this.lastPriceUpdate.get(symbol) < maxAge
     );
-  }
-
-  async validateSymbol(symbol) {
-    const symbols = await this.getSymbols();
-    if (symbols.includes(symbol)) {
-      const info = await this.getSymbolInfo(symbol);
-      if (info.trade_mode !== 0) {
-        console.log(
-          `Validated symbol ${symbol} with filling mode: ${info.filling_mode}`
-        );
-        return symbol; // Return the exact symbol as validated
-      }
-      console.warn(`Symbol ${symbol} not tradable`);
-    }
-    const matches = symbols.filter(
-      (s) =>
-        s.toLowerCase().includes(symbol.toLowerCase()) ||
-        s.toLowerCase().includes("xau") ||
-        s.toLowerCase().includes("gold") ||
-        s === process.env.MT5_SYMBOL ||
-        "XAUUSD_TTBAR.Fix" ||
-        s === "XAUUSD"
-    );
-    for (const match of matches) {
-      const info = await this.getSymbolInfo(match);
-      if (info.trade_mode !== 0) {
-        console.log(
-          `Alternative symbol ${match} validated with filling mode: ${info.filling_mode}`
-        );
-        return match; // Return the matched symbol
-      }
-    }
-    throw new Error(
-      `Symbol ${symbol} not found or tradable. Alternatives: ${matches.join(
-        ", "
-      )}`
-    );
-  }
-
-  async testConnection() {
-    try {
-      if (!this.isConnected) throw new Error("Not connected");
-      const testResult = await this.getPrice(
-        process.env.MT5_SYMBOL || "XAUUSD_TTBAR.Fix"
-      );
-      console.log("Connection test passed:", testResult);
-      return { success: true, message: "MT5 working", testPrice: testResult };
-    } catch (error) {
-      console.error("Connection test failed:", error);
-      return {
-        success: false,
-        message: "MT5 test failed",
-        error: error.message,
-      };
-    }
   }
 }
 

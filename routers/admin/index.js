@@ -27,7 +27,7 @@ import {
   updateTrade,
   getLPTrades,
   getUserOrdersByAdmin,
-  getLPProfitOrdersByAdmin
+  getLPProfitOrdersByAdmin,
 } from "../../controllers/admin/tradingController.js";
 import {
   createTransaction,
@@ -35,6 +35,17 @@ import {
   getUserTransactionsByAdmin,
   getLedgerData,
 } from "../../controllers/admin/transactionController.js";
+
+import {
+  getChartData,
+  getMISOverview,
+  getSymbolAnalysis,
+  getSymbolPerformanceByDate,
+  getTopSymbols,
+  getTopUsersByOrders,
+  getTransactionBreakdown,
+  getUserActivity,
+} from "../../controllers/admin/dashboardController.js";
 const router = express.Router();
 router.post("/login", loginAdmin);
 router.get("/fetch-data/:adminId", getAllData);
@@ -68,5 +79,18 @@ router.get("/fetch-transaction", getAllTransactions);
 router.get("/user-transactions/:adminId/:userId", getUserTransactionsByAdmin);
 //ledger management
 router.get("/fetch-ledger", getLedgerData);
+//overview and analytics
+router.get("/overview/:adminId", getMISOverview);
+// User performance endpoints
+router.get("/top-users/:adminId", getTopUsersByOrders);
+router.get("/user-activity/:adminId/:userId", getUserActivity);
+router.get("/transaction-breakdown/:adminId", getTransactionBreakdown);
+// Symbol analysis endpoints
+router.get("/symbol-analysis/:adminId", getSymbolAnalysis);
+router.get("/symbol-performance/:adminId", getSymbolPerformanceByDate);
+router.get("/top-symbols/:adminId", getTopSymbols);
+
+// Chart data endpoint
+router.get("/charts/:adminId", getChartData);
 
 export default router;
